@@ -1,0 +1,123 @@
+# Builds PARLA from the PRIVATE source repo (mordf0kas/parla) for macOS (universal) + Windows and
+# publishes the installers here. Runs in this PUBLIC repo because Actions minutes are free for public
+# repos (the private repos are blocked by GitHub billing). The source is fetched with a read-only
+# deploy key (secret PARLA_SRC_KEY) and never stored here. Run it: Actions -> build -> Run workflow.
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / tag / commit of mordf0kas/parla to build"
+        default: main
+      windows:
+        description: "Also build the Windows installer"
+        type: boolean
+        default: true
+      publish:
+        description: "Upload the installers to release v<version> here (version from CMakeLists.txt)"
+        type: boolean
+        default: true
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Skip Windows unless asked
+        id: gate
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ] && [ "${{ inputs.windows }}" != "true" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Fetch the source (private repo, read-only deploy key)
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: mordf0kas/parla
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PARLA_SRC_KEY }}
+          persist-credentials: false
+      - name: Fetch JUCE 8.0.4
+        if: steps.gate.outputs.run == 'true'
+        run: git clone --depth 1 --branch 8.0.4 https://github.com/juce-framework/JUCE.git JUCE
+      - name: Configure
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          else
+            cmake -B build
+          fi
+      - name: Build
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          T="Parla_VST3 Parla_Standalone"
+          [ "${{ matrix.os }}" = "macos-latest" ] && [ "0" = "1" ] && T="$T Parla_AU"
+          cmake --build build --config Release --target $T --parallel 4
+          mkdir -p out
+          sed -n 's/^project(Parla VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt > out/VERSION
+      - name: Package macOS installer (.pkg, ad-hoc signed, quarantine stripped)
+        if: steps.gate.outputs.run == 'true' && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="build/Parla_artefacts/Release"; P="PARLA"
+          # JUCE writes moduleinfo.json after signing: re-sign so Apple Silicon hosts load the bundles
+          for b in "$R/VST3/$P.vst3" "$R/Standalone/$P.app" "$R/AU/$P.component"; do
+            [ -e "$b" ] && codesign --force --deep --sign - "$b" && codesign --verify --deep --strict "$b"
+          done
+          mkdir -p pkg_root/Applications pkg_root/Library/Audio/Plug-Ins/VST3 pkg_root/Library/Audio/Plug-Ins/Components pkg_scripts
+          cp -R "$R/VST3/$P.vst3" pkg_root/Library/Audio/Plug-Ins/VST3/
+          cp -R "$R/Standalone/$P.app" pkg_root/Applications/
+          [ -e "$R/AU/$P.component" ] && cp -R "$R/AU/$P.component" pkg_root/Library/Audio/Plug-Ins/Components/
+          cat > pkg_scripts/postinstall <<EOS
+          #!/bin/bash
+          xattr -dr com.apple.quarantine "/Library/Audio/Plug-Ins/VST3/$P.vst3" "/Library/Audio/Plug-Ins/Components/$P.component" "/Applications/$P.app" 2>/dev/null || true
+          exit 0
+          EOS
+          chmod +x pkg_scripts/postinstall
+          pkgbuild --analyze --root pkg_root components.plist
+          i=0; while plutil -extract "$i" xml1 -o /dev/null components.plist 2>/dev/null; do plutil -replace "$i.BundleIsRelocatable" -bool NO components.plist; i=$((i+1)); done
+          V=$(cat out/VERSION)
+          pkgbuild --root pkg_root --component-plist components.plist --scripts pkg_scripts --identifier "com.drelva.parla.installer" --version "$V" --install-location / component.pkg
+          productbuild --package component.pkg "out/PARLA-v$V-macOS.pkg"
+      - name: Package Windows installer (Inno Setup)
+        if: steps.gate.outputs.run == 'true' && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DBuildDir=..\build installer\PARLA.iss
+          $v = (Get-Content out\VERSION).Trim()
+          Get-ChildItem installer_out\*.exe | Select-Object -First 1 | Copy-Item -Destination "out\PARLA-v$v-Windows-Setup.exe"
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: PARLA-${{ matrix.os }}
+          path: out
+
+  release:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to the release
+        run: |
+          VERSION=$(tr -d '\r\n' < dist/VERSION); TAG="v$VERSION"
+          FILES=(); for f in dist/PARLA*; do [ -s "$f" ] && FILES+=("$f"); done
+          [ ${#FILES[@]} -gt 0 ] || { echo "::error::nothing to upload"; exit 1; }
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" --title "PARLA $TAG" --notes "PARLA $TAG"
+          fi
