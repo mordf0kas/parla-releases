@@ -66,7 +66,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          R="build/Parla_artefacts/Release"; P="PARLA"
+          R="build/Parla_artefacts/Release"; P="Parla"
           # JUCE writes moduleinfo.json after signing: re-sign so Apple Silicon hosts load the bundles
           for b in "$R/VST3/$P.vst3" "$R/Standalone/$P.app" "$R/AU/$P.component"; do
             [ -e "$b" ] && codesign --force --deep --sign - "$b" && codesign --verify --deep --strict "$b"
@@ -119,5 +119,5 @@ jobs:
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" "${FILES[@]}" --clobber
           else
-            gh release create "$TAG" "${FILES[@]}" --title "PARLA $TAG" --notes "PARLA $TAG"
+            gh release create "$TAG" "${FILES[@]}" --title "Parla $TAG" --notes "Parla $TAG"
           fi
